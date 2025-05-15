@@ -1,5 +1,5 @@
 
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.22.1)
 
 project(NativeVNC C CXX ASM)
 
@@ -92,14 +92,23 @@ include_directories(${AVNC_LIBVNC_SRC_DIR}/include ${AVNC_LIBVNC_BUILD_DIR}/incl
 ###############################################################################
 set(AVNC_NATIVE_SOURCE src/main/cpp/native-vnc.cpp)
 
-add_library(native-vnc SHARED ${AVNC_NATIVE_SOURCE})
+add_library(native-vnc SHARED ${AVNC_NATIVE_SOURCE}
 
-target_link_libraries(native-vnc vncclient)
+        src/main/cpp/RenderStuff/RenderObject.cpp
+        src/main/cpp/CameraDevice.cpp
+)
+
+target_link_libraries(native-vnc vncclient android -lEGL mediandk camera2ndk )
+
+
+target_include_directories(native-vnc
+        PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/main/cpp/glm)
 
 
 # Link NDK libraries
 find_library(LIB_LOG log)
 target_link_libraries(native-vnc ${LIB_LOG})
 
-find_library(LIB_GLES GLESv2)
+find_library(LIB_GLES GLESv3)
 target_link_libraries(native-vnc ${LIB_GLES})

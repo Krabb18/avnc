@@ -7,607 +7,258 @@
  */
 
 #include <jni.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h> // OpenGL ES 3.0 Header
 #include <rfb/rfbclient.h>
+#include <EGL/egl.h>
+#include <android/native_window_jni.h>
+#include <thread>
 
+#include "RenderStuff/RenderObject.h"
 #include "ClientEx.h"
 #include "Utility.h"
+#include "glm/glm.hpp"
 
+#include <camera/NdkCameraManager.h>      // Für ACameraManager und Kamera-Verwaltung
+#include <camera/NdkCameraDevice.h>       // Für ACameraDevice und Geräteoperationen
+#include <camera/NdkCameraMetadata.h>     // Für Kamera-Metadaten
+#include <camera/NdkCameraError.h>        // Für Fehlercodes der Kamera-API
+#include <media/NdkImageReader.h>         // Für AImageReader zum Erfassen von Bilddaten
+#include <media/NdkImage.h>
 
-/******************************************************************************
- * Library Initialization
- *****************************************************************************/
+#include "CameraDevice.h"
 
-struct JniContext {
-    JavaVM *vm;                     //JVM Instance
-    jclass managedCls;              //Managed `VncClient` class
-    jmethodID cbFramebufferUpdated; //Cached reference to managed callback
+glm::mat4 model = glm::mat4(1.0f);
 
-    JNIEnv *getEnv() const {
-        JNIEnv *env = nullptr;
+#define LOG_TAG "NativeDebug"
 
-        if (vm != nullptr && vm->GetEnv((void **) &env, JNI_VERSION_1_6) == JNI_OK)
-            return env;
+// Definiere die Log-Level-Funktion
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-        return nullptr; //Should not happen
-    }
+const EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_BLUE_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_RED_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 24,
+        EGL_NONE
 };
 
-static JniContext context{};
+const EGLint contextAttribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_NONE
+};
 
-/**
- * Called when our library is loaded.
- */
-JNIEXPORT jint
-JNI_OnLoad(JavaVM *vm, void *unused) {
-    context.vm = vm;
+EGLDisplay display;
+EGLSurface eglSurface;
+EGLContext context;
 
-    if (context.getEnv() == nullptr)
-        return JNI_ERR;
+int32_t width = 0;
+int32_t height = 0;
 
-    return JNI_VERSION_1_6;
+bool started = false;
+rfbClient* client;
+bool initSucceded = false;
+
+GLuint frameBufferTexture;
+RenderObject renderObject;
+
+const char *adress = "";
+int portAddr = 1234;
+
+CameraDeviceManager camManager;
+
+//AB HIER BEGINNT DER RICHTIGE CODE
+
+void Main();
+
+extern "C"
+JNIEXPORT jstring JNICALL
+
+
+Java_com_gaurav_avnc_MainActivity_sayHelloFromJNI(JNIEnv *env, jobject thiz) {
+
+    return env->NewStringUTF("Hello from native C++!");
 }
 
-JNIEXPORT void
-JNI_OnUnload(JavaVM *vm, void *reserved) {
-    if (context.managedCls) {
-        context.getEnv()->DeleteGlobalRef(context.managedCls);
-        context.managedCls = nullptr;
-    }
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_gaurav_avnc_MainActivity_nativeSetServerAddress(JNIEnv *env, jobject thiz, jstring addr)
+{
+    //Am anfang wird direkt nach der bip adresse gefragt
+   adress = env->GetStringUTFChars(addr, 0);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_gaurav_avnc_MainActivity_nativeSetServerPort(JNIEnv *env, jobject thiz, jint port)
+{
+    //Auch wird am anfang direkt nach dem prot gefragt
+    portAddr = port;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_gaurav_avnc_MainActivity_createGL(JNIEnv *env, jobject thiz) {
+    Main();
 }
 
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_initLibrary(JNIEnv *env, jclass clazz) {
-    if (context.managedCls)
-        context.getEnv()->DeleteGlobalRef(context.managedCls);
+Java_com_gaurav_avnc_MainActivity_nativeSetSurface(JNIEnv *env, jobject thiz, jobject surface) {
+    //Surface für das opengl fenster
+    rfbClient  client;
+    ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
+    width = ANativeWindow_getWidth(nativeWindow);
+    height = ANativeWindow_getHeight(nativeWindow);
 
-    context.managedCls = (jclass) env->NewGlobalRef(clazz);
-    context.cbFramebufferUpdated = env->GetMethodID(context.managedCls, "cbFinishedFrameBufferUpdate", "()V");
-    //TODO: Cache more method IDs so we don't have to repeatedly search them
+    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    eglInitialize(display, nullptr, nullptr);
 
-    rfbClientLog = &log_info;
-    rfbClientErr = &log_error;
-}
+    EGLConfig  config;
+    EGLint  numConfigs;
+    eglChooseConfig(display, configAttribs, &config, 1, &numConfigs);
 
+    EGLint  format;
+    eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format);
+    ANativeWindow_setBuffersGeometry(nativeWindow, 0, 0, format);
+    eglSurface = eglCreateWindowSurface(display, config, nativeWindow, nullptr);
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
 
-/******************************************************************************
- * rfbClient Callbacks
- *****************************************************************************/
-
-static char *onGetPassword(rfbClient *client) {
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
-
-    auto mid = env->GetMethodID(cls, "cbGetPassword", "()Ljava/lang/String;");
-    auto jPassword = (jstring) env->CallObjectMethod(obj, mid);
-
-    return getNativeStrCopy(env, jPassword);
-}
-
-static rfbCredential *onGetCredential(rfbClient *client, int credentialType) {
-    if (credentialType == rfbCredentialTypeX509) {
-        // Return empty credentials here, server certificate will be verified later
-        auto credential = (rfbCredential *) malloc(sizeof(rfbCredential));
-        memset(credential, 0, sizeof(rfbCredential));
-        return credential;
+    if (eglMakeCurrent(display, eglSurface, eglSurface, context) == EGL_FALSE) {
+        //aout << "eglMakeCurrent failed: " << eglGetError() << std::endl;
     }
 
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
+    glViewport(0, 0, width, height);
 
-    //Retrieve credentials
-    jmethodID mid = env->GetMethodID(cls, "cbGetCredential",
-                                     "()Lcom/gaurav/avnc/vnc/UserCredential;");
-    jobject jCredential = env->CallObjectMethod(obj, mid);
-    if (jCredential == nullptr) {
-        return nullptr;
-    }
-
-    //Extract username & password
-    auto jCredentialCls = env->GetObjectClass(jCredential);
-    auto usernameField = env->GetFieldID(jCredentialCls, "username", "Ljava/lang/String;");
-    auto jUsername = env->GetObjectField(jCredential, usernameField);
-
-    auto passwordField = env->GetFieldID(jCredentialCls, "password", "Ljava/lang/String;");
-    auto jPassword = env->GetObjectField(jCredential, passwordField);
-
-    //Create native rfbCredential
-    auto credential = (rfbCredential *) malloc(sizeof(rfbCredential));
-    credential->userCredential.username = getNativeStrCopy(env, (jstring) jUsername);
-    credential->userCredential.password = getNativeStrCopy(env, (jstring) jPassword);
-
-    return credential;
 }
 
-static rfbBool onVerifyServerCertificate(rfbClient *client, const unsigned char *der, int der_len) {
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
+//rfb funktionen
+rfbBool  myMallocFramebuffer(rfbClient* cl)
+{
+    int width = cl->width;
+    int height = cl->height;
+    int bpp = cl->format.bitsPerPixel / 8;
 
-    jmethodID mid = env->GetMethodID(cls, "cbVerifyServerCertificate", "([B)Z");
-    jbyteArray bytes = env->NewByteArray(der_len);
-    env->SetByteArrayRegion(bytes, 0, der_len, reinterpret_cast<const jbyte *>(der));
-    auto result = env->CallBooleanMethod(obj, mid, bytes);
-    env->DeleteLocalRef(bytes);
-    return result ? TRUE : FALSE;
-}
-
-static void onBell(rfbClient *client) {
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
-
-    jmethodID mid = env->GetMethodID(cls, "cbBell", "()V");
-    env->CallVoidMethod(obj, mid);
-}
-
-static void onGotXCutText(rfbClient *client, const char *text, int len, bool is_utf8) {
-    if (!text || len <= 0) return;
-
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
-
-    jmethodID mid = env->GetMethodID(cls, "cbGotXCutText", "([BZ)V");
-    jbyteArray bytes = env->NewByteArray(len);
-    env->SetByteArrayRegion(bytes, 0, len, reinterpret_cast<const jbyte *>(text));
-    env->CallVoidMethod(obj, mid, bytes, is_utf8);
-    env->DeleteLocalRef(bytes);
-}
-
-static void onGotXCutTextLatin1(rfbClient *client, const char *text, int len) {
-    onGotXCutText(client, text, len, false);
-}
-
-static void onGotXCutTextUTF8(rfbClient *client, const char *text, int len) {
-    if (text && len > 0 && text[len - 1] == '\0')
-        --len; // LibVNCClient includes terminating NULL in length for UTF8
-    onGotXCutText(client, text, len, true);
-}
-
-static rfbBool onHandleCursorPos(rfbClient *client, int x, int y) {
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
-
-    jmethodID mid = env->GetMethodID(cls, "cbHandleCursorPos", "(II)V");
-    env->CallVoidMethod(obj, mid, x, y);
-
-    return TRUE;
-}
-
-static void onFinishedFrameBufferUpdate(rfbClient *client) {
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-
-    env->CallVoidMethod(obj, context.cbFramebufferUpdated);
-}
-
-/**
- * We need to use our own allocator to know when frame size has changed.
- * and to acquire framebuffer lock during modification.
- */
-static rfbBool onMallocFrameBuffer(rfbClient *client) {
-
-    const auto width = client->width;
-    const auto height = client->height;
-    const auto requestedSize = (uint64_t) width * height * client->format.bitsPerPixel / 8;
-
-    if (requestedSize >= SIZE_MAX) {
-        rfbClientErr("CRITICAL: cannot allocate frameBuffer, requested size is too large\n");
-        return FALSE;
-    }
-
-    auto allocSize = (size_t) requestedSize;
-    auto ex = getClientExtension(client);
-
-    LOCK(ex->mutex);
+    if(cl->frameBuffer)
     {
-
-        if (client->frameBuffer)
-            free(client->frameBuffer);
-
-        client->frameBuffer = static_cast<uint8_t *>(malloc(allocSize));
-
-        if (client->frameBuffer) {
-            ex->fbRealWidth = width;
-            ex->fbRealHeight = height;
-            memset(client->frameBuffer, 0, allocSize); //Clear any garbage
-        } else {
-            ex->fbRealWidth = 0;
-            ex->fbRealHeight = 0;
-        }
+        free(cl->frameBuffer);
     }
-    UNLOCK(ex->mutex);
 
-    if (client->frameBuffer == nullptr) {
-        rfbClientErr("CRITICAL: frameBuffer allocation failed\n");
+    cl->frameBuffer = (uint8_t*)malloc(width * height * bpp);
+
+    if (!cl->frameBuffer) {
         return FALSE;
     }
-
-    auto obj = getManagedClient(client);
-    auto env = context.getEnv();
-    auto cls = context.managedCls;
-
-    auto mid = env->GetMethodID(cls, "cbFramebufferSizeChanged", "(II)V");
-    env->CallVoidMethod(obj, mid, width, height);
 
     return TRUE;
 }
 
-static void onGotCursorShape(rfbClient *client, int xHot, int yHot, int width, int height, int bytesPerPixel) {
-    auto ex = getClientExtension(client);
+void myFramebufferUpdate(rfbClient* cl, int x, int y, int w, int h)
+{
+    glActiveTexture(GL_TEXTURE0);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGB, GL_UNSIGNED_BYTE, client->frameBuffer + (y * client->width + x) * 3);
 
-    LOCK(ex->mutex);
-
-    //Steel buffers from rfbClient
-    updateCursor(ex->cursor, client->rcSource, client->rcMask, (uint16_t) width, (uint16_t) height,
-                 (uint16_t) xHot, (uint16_t) yHot);
-    client->rcSource = NULL;
-    client->rcMask = NULL;
-
-    UNLOCK(ex->mutex);
-
-    //Fake framebuffer update to trigger rendering
-    onFinishedFrameBufferUpdate(client);
+    printf("Framebuffer update: x=%d y=%d w=%d h=%d\n", x, y, w, h);
 }
 
-/**
- * Hooks callbacks to rfbClient.
- */
-static void setCallbacks(rfbClient *client) {
-    client->GetPassword = onGetPassword;
-    client->GetCredential = onGetCredential;
-    client->VerifyServerCertificate = onVerifyServerCertificate;
-    client->Bell = onBell;
-    client->GotXCutText = onGotXCutTextLatin1;
-    client->GotXCutTextUTF8 = onGotXCutTextUTF8;
-    client->HandleCursorPos = onHandleCursorPos;
-    client->FinishedFrameBufferUpdate = onFinishedFrameBufferUpdate;
-    client->MallocFrameBuffer = onMallocFrameBuffer;
-    client->GotCursorShape = onGotCursorShape;
+void myFinishFrame(rfbClient* cl) {
+    // Optional: z. B. FPS zählen oder fertig melden
+    printf("Frame update complete.\n");
+}
+
+void connectingThread()
+{
+    if (rfbInitClient(client, nullptr, nullptr))
+    {
+        initSucceded = true;
+        LOGI("VERBUNDEN");
+    }
 }
 
 
-/******************************************************************************
- * Native method Implementation
- *****************************************************************************/
+void Main()
+{
+    if(!started)
+    {
+        camManager.Init();
+        camManager.OpenDevice();
+        renderObject.Init();
 
-extern "C"
-JNIEXPORT jlong JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeClientCreate(JNIEnv *env, jobject thiz) {
-    rfbClient *client = rfbGetClient(8, 3, 4);
-    if (client == nullptr)
-        return 0;
+        glGenTextures(1, &frameBufferTexture);
+        glBindTexture(GL_TEXTURE_2D, frameBufferTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(
+                GL_TEXTURE_2D, 0, GL_RGB,
+                width, height, 0,
+                GL_RGB, GL_UNSIGNED_BYTE, nullptr
+        );
 
-    auto ex = assignClientExtension(client);
-    if (!ex)
-        return 0;
+        LOGI("VERBINDE");
+        client = rfbGetClient(8, 3, 4); // RGB888
+        client->MallocFrameBuffer = myMallocFramebuffer;
+        client->GotFrameBufferUpdate = myFramebufferUpdate;
+        client->FinishedFrameBufferUpdate = myFinishFrame;
 
-    setCallbacks(client);
-    client->canHandleNewFBSize = TRUE;
-    client->interruptFd = ex->interruptReadFd;
+        client->serverHost = strdup(adress);
+        client->serverPort = portAddr;  // Standard VNC-Port
 
-    //Attach reference to managed object
-    auto obj = env->NewGlobalRef(thiz);
-    setManagedClient(client, obj);
+        std::thread connectThread(&connectingThread);
+        connectThread.detach();
 
-    return (jlong) client;
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeConfigure(JNIEnv *env, jobject thiz, jlong client_ptr,
-                                                   jint securityType, jboolean use_local_cursor, jint image_quality,
-                                                   jboolean use_raw_encoding) {
-    auto client = (rfbClient *) client_ptr;
-
-    // 0 means all auth types
-    if (securityType != 0) {
-        uint32_t auth[1] = {static_cast<uint32_t>(securityType)};
-        SetClientAuthSchemes(client, auth, 1);
+        started = true;
     }
 
-    if (use_local_cursor) {
-        client->appData.useRemoteCursor = TRUE;
-        getClientExtension(client)->cursor = newCursor();
+    //LOGI("Main() wird aufgerufen!");
+    glClearColor(1.0f, 0.1f, 0.1f, 1.0f); // Hintergrundfarbe
+    glClear(GL_COLOR_BUFFER_BIT);
+
+
+    if(initSucceded)
+    {
+        //Digitalen bildschirm anzeigen
     }
-
-    client->appData.qualityLevel = image_quality;
-    if (use_raw_encoding)
-        client->appData.encodingsString = "raw";
-
-    // Change pixel format to match with the default format used by most VNC
-    // servers. Technically, we should not have to this as VNC servers have to
-    // respect whatever pixel format client prefers. But there are some wierd
-    // servers which ignore pixel format sent by client. As a result, users
-    // blame AVNC for not rendering the colors properly.
-    // Note: This change affects how OpenGL Texture for framebuffer is rendered,
-    // and it only works for 24 bit-per-pixel density.
-    client->format.redShift = 16;
-    client->format.greenShift = 8;
-    client->format.blueShift = 0;
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeSetDest(JNIEnv *env, jobject thiz, jlong client_ptr,
-                                                 jstring host, jint port) {
-    auto client = (rfbClient *) client_ptr;
-    client->destHost = getNativeStrCopy(env, host);
-    client->destPort = port;
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeInit(JNIEnv *env, jobject thiz, jlong client_ptr,
-                                              jstring host, jint port) {
-    auto client = (rfbClient *) client_ptr;
-
-    client->serverHost = getNativeStrCopy(env, host);
-    client->serverPort = port < 100 ? port + 5900 : port;
-
-    if (rfbInitClient(client, nullptr, nullptr)) {
-        return JNI_TRUE;
-    }
-
-    return JNI_FALSE;
-
-}
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeIsServerMacOS(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    auto client = (rfbClient *) client_ptr;
-    return client->serverMajor == 3 && client->serverMinor == 889;
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeInterrupt(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    setInterrupt((rfbClient *) client_ptr);
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeCleanup(JNIEnv *env, jobject thiz,
-                                                 jlong client_ptr) {
-    auto client = (rfbClient *) client_ptr;
-
-    if (client->frameBuffer) {
-        free(client->frameBuffer);
-        client->frameBuffer = nullptr;
-    }
-
-    auto managedClient = getManagedClient(client);
-    env->DeleteGlobalRef(managedClient);
-
-    freeClientExtension(client);
-    rfbClientCleanup(client);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeProcessServerMessage(JNIEnv *env, jobject thiz,
-                                                              jlong client_ptr) {
-    auto client = (rfbClient *) client_ptr;
-
-    auto waitResult = WaitForMessageInterruptible(client, 1000000, client->interruptFd);
-
-    if (waitResult == 0) // Timeout
-        return JNI_TRUE;
-
-    if (waitResult > 0 && HandleRFBServerMessage(client))
-        return JNI_TRUE;
-
-    if (errno == EINTR)
-        rfbClientLog("Message processing interrupted");
-
-    return JNI_FALSE;
-}
-
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeGetLastErrorStr(JNIEnv *env, jobject thiz) {
-    auto str = errnoToStr(errno);
-    return env->NewStringUTF(str);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeSendKeyEvent(JNIEnv *env, jobject thiz, jlong client_ptr,
-                                                      jint key_sym, jint xt_code, jboolean is_down) {
-    auto client = (rfbClient *) client_ptr;
-    rfbBool down = is_down ? TRUE : FALSE;
-
-    if (xt_code > 0 && SendExtendedKeyEvent(client, key_sym, xt_code, down))
-        return JNI_TRUE;
     else
-        return SendKeyEvent(client, key_sym, down);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeSendPointerEvent(JNIEnv *env, jobject thiz, jlong client_ptr, jint x, jint y,
-                                                          jint mask) {
-    return (jboolean) SendPointerEvent((rfbClient *) client_ptr, x, y, mask);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeSendCutText(JNIEnv *env, jobject thiz, jlong client_ptr, jbyteArray bytes,
-                                                     jboolean is_utf8) {
-    auto client = (rfbClient *) client_ptr;
-    auto textBuffer = env->GetByteArrayElements(bytes, nullptr);
-    auto textLen = env->GetArrayLength(bytes);
-    auto textChars = reinterpret_cast<char *>(textBuffer);
-
-    rfbBool result = is_utf8
-                     ? SendClientCutTextUTF8(client, textChars, textLen)
-                     : SendClientCutText(client, textChars, textLen);
-
-    env->ReleaseByteArrayElements(bytes, textBuffer, JNI_ABORT);
-    return (jboolean) result;
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeIsUTF8CutTextSupported(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    return (jboolean) (((rfbClient *) client_ptr)->extendedClipboardServerCapabilities != 0);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeSetDesktopSize(JNIEnv *env, jobject thiz, jlong client_ptr, jint width,
-                                                        jint height) {
-    return (jboolean) SendExtDesktopSize((rfbClient *) client_ptr, width, height);
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeRefreshFrameBuffer(JNIEnv *env, jobject thiz, jlong clientPtr) {
-    auto client = (rfbClient *) clientPtr;
-    return (jboolean) SendFramebufferUpdateRequest(client, 0, 0, client->width, client->height, TRUE);
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativePauseFramebufferUpdates(JNIEnv *env, jobject thiz, jlong client_ptr,
-                                                                 jboolean pause) {
-    auto client = ((rfbClient *) client_ptr);
-    auto wasPaused = client->pauseFramebufferUpdates;
-    client->pauseFramebufferUpdates = pause;
-    if (wasPaused && !pause)
-        SendFramebufferUpdateRequest(client, 0, 0, client->width, client->height, FALSE);
-}
-
-extern "C"
-JNIEXPORT jstring JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeGetDesktopName(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    auto client = (rfbClient *) client_ptr;
-    return env->NewStringUTF(client->desktopName ? client->desktopName : "");
-}
-
-extern "C"
-JNIEXPORT jint JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeGetWidth(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    return ((rfbClient *) client_ptr)->width;
-}
-
-extern "C"
-JNIEXPORT jint JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeGetHeight(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    return ((rfbClient *) client_ptr)->height;
-}
-
-extern "C"
-JNIEXPORT jboolean JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeIsEncrypted(JNIEnv *env, jobject thiz, jlong client_ptr) {
-    return static_cast<jboolean>(((rfbClient *) client_ptr)->tlsSession ? JNI_TRUE : JNI_FALSE);
-}
-
-extern "C"
-JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeUploadFrameTexture(JNIEnv *env, jobject thiz,
-                                                            jlong client_ptr) {
-    auto client = (rfbClient *) client_ptr;
-    auto ex = getClientExtension(client);
-
-    LOCK(ex->mutex);
-
-    if (client->frameBuffer) {
-        glTexImage2D(GL_TEXTURE_2D,
-                     0,
-                     GL_RGBA,
-                     ex->fbRealWidth,
-                     ex->fbRealHeight,
-                     0,
-                     GL_RGBA,
-                     GL_UNSIGNED_BYTE,
-                     client->frameBuffer);
-
-        // Note: client->frameBuffer data is actually in 'BGRA' format, instead of 'RGBA'.
-        // But OpenGL ES doesn't support that directly. So we use 'GL_RGBA' here, and flip
-        // the components to correct order inside fragment shader.
+    {
+        //loading screen
     }
 
-    UNLOCK(ex->mutex);
+    //Render loop
+    renderObject.textureID = camManager.getTexureID();
+    renderObject.Render();
+
+    eglSwapBuffers(display, eglSurface);
+
 }
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_gaurav_avnc_vnc_VncClient_nativeUploadCursor(JNIEnv *env, jobject thiz, jlong client_ptr, jint px, jint py) {
+Java_com_gaurav_avnc_MainActivity_nativeSetCameraSurface(JNIEnv *env, jobject thiz, jobject surface) {
+    //CameraShit
 
-    auto client = (rfbClient *) client_ptr;
-    auto ex = getClientExtension(client);
-    auto cursor = ex->cursor;
 
-    if (!cursor)
-        return;
+}
 
-    //Current algo for cursor rendering is slightly weird. Main issue is that
-    //glTexSubImage2D() does not perform any composition with target texture.
-    //So, we have to manually blend transparent/invalid pixels of the cursor
-    //with corresponding pixels from framebuffer. scratchBuffer is used for
-    //this composition.
 
-    LOCK(ex->mutex);
-
-    //Effective cursor position in framebuffer
-    int32_t fbCursorX = px - cursor->xHot;
-    int32_t fbCursorY = py - cursor->yHot;
-
-    //Rectangular portion of the framebuffer to be updated.
-    //Cursor can overflow outside the framebuffer if moved near the edges,
-    //but glTexSubImage2D() doesn't allow values outside target texture,
-    //so we need to only update the intersection of framebuffer & cursor.
-    int32_t left = -1, top = -1, right = -1, bottom = -1;
-
-    auto fb = (uint32_t *) client->frameBuffer;
-    auto buffer = (uint32_t *) cursor->buffer;
-    auto scratch = (uint32_t *) cursor->scratchBuffer;
-    auto mask = cursor->mask;
-
-    //Scratch buffer index
-    int32_t z = 0;
-
-    for (int32_t y = 0; y < cursor->height; ++y) {
-        for (int32_t x = 0; x < cursor->width; ++x) {
-
-            //Corresponding pixel in framebuffer
-            auto fbX = fbCursorX + x;
-            auto fbY = fbCursorY + y;
-
-            if (fbX >= 0 && fbX < ex->fbRealWidth && fbY >= 0 && fbY < ex->fbRealHeight) {
-                auto isValidPixel = mask[y * cursor->width + x];
-                if (isValidPixel)
-                    scratch[z++] = buffer[y * cursor->width + x];
-                else
-                    scratch[z++] = fb[fbY * ex->fbRealWidth + fbX];
-
-                if (left == -1 && top == -1) {
-                    left = fbX;
-                    top = fbY;
-                }
-                right = fbX;
-                bottom = fbY;
-            }
-        }
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_gaurav_avnc_MainActivity_nativeCleanup(JNIEnv *env, jobject thiz) {
+    if(!initSucceded)
+    {
+        rfbClientCleanup(client);
+        initSucceded = true;
     }
 
-    if (left >= 0 && top >= 0)
-        glTexSubImage2D(GL_TEXTURE_2D,
-                        0,
-                        left,
-                        top,
-                        right - left + 1,
-                        bottom - top + 1,
-                        GL_RGBA,
-                        GL_UNSIGNED_BYTE,
-                        scratch);
+    renderObject.Delete();
+    glDeleteTextures(1, &frameBufferTexture);
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(display, context);
+    eglDestroySurface(display, eglSurface);
+    eglTerminate(display);
 
-    UNLOCK(ex->mutex);
 }

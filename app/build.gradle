@@ -1,5 +1,5 @@
 plugins {
-    id 'com.android.application' version '8.7.3'
+    id 'com.android.application' version '8.6.0'
     id 'org.jetbrains.kotlin.android' version '1.9.24'
     id 'org.jetbrains.kotlin.kapt' version '1.9.24'
     id 'org.jetbrains.kotlin.plugin.serialization' version '1.9.24'
@@ -14,7 +14,7 @@ android {
 
     defaultConfig {
         applicationId "com.gaurav.avnc"
-        minSdk 21
+        minSdk 26
         targetSdk 35
         versionCode 42
         versionName "2.8.0"
@@ -29,6 +29,7 @@ android {
             cmake {
                 //We are not using STL
                 arguments '-DANDROID_STL=none'
+                arguments "-DANDROID_STL=c++_shared"
                 targets 'native-vnc', 'vncclient', 'turbojpeg-static', 'wolfssl'
             }
         }
@@ -119,4 +120,11 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit-ktx:1.2.1"
     androidTestImplementation "androidx.room:room-testing:$roomVersion"
     androidTestImplementation "io.mockk:mockk-android:1.12.0"
+    // CameraX Core
+    implementation "androidx.camera:camera-core:1.1.0"
+    // CameraX Camera2 (wenn du Camera2 verwenden willst)
+    implementation "androidx.camera:camera-camera2:1.1.0"
+    // CameraX Lifecycle (damit es mit dem Lebenszyklus funktioniert)
+    implementation "androidx.camera:camera-lifecycle:1.1.0"
+
 }
